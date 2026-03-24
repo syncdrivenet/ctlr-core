@@ -214,3 +214,139 @@ curl -X POST http://localhost:8000/preflight -H "Content-Type: application/json"
 # Simulate node confirmation
 mosquitto_pub -t "ctlr/node/node1/ready" -m '{"node_id": "node1", "ready": true}'
 ```
+
+---
+
+# Camera Node
+
+## Overview
+
+Camera nodes are distributed recording devices coordinated by the central controller.
+Each node connects via MQTT, responds to controller commands, and manages local recording.
+
+## State Machine
+
+```
+init → ready ⇄ preflight → recording → finishing → ready
+                  ↓                        ↓
+               (error)                  (error)
+                  ↓                        ↓
+                ready                    ready
+```
+
+| State | Description |
+|-------|-------------|
+| `init` | Hardware initialization, MQTT connection |
+| `ready` | Idle, publishing health, awaiting commands |
+| `preflight` | Running checks, confirming readiness |
+| `recording` | Capturing video, publishing status |
+| `finishing` | Finalizing file, flushing buffers |
+| `error` | Transient state, logs error then returns to `ready` |
+
+## MQTT Topics
+
+### Subscribed (from Controller)
+
+| Topic | Payload | Action |
+|-------|---------|--------|
+| `ctlr/command` | `{action: "prepare", ...}` | Run preflight checks |
+| `ctlr/command` | `{action: "start", ...}` | Begin recording |
+| `ctlr/command` | `{action: "stop", ...}` | Stop recording |
+| `ctlr/command` | `{action: "abort", ...}` | Cancel preflight |
+
+### Published (to Controller)
+
+| Topic | When | Payload |
+|-------|------|---------|
+| `ctlr/node/{id}/ready` | Preflight pass/fail | `{node_id, ready: bool, error?: string}` |
+| `ctlr/node/{id}/status` | Every `STATUS_INTERVAL_SECS` | Health + recording metrics |
+
+## Status Payload
+
+```json
+{
+  "node_id": "cam-01",
+  "node_name": "Front Camera",
+  "state": "recording",
+  "health": "ok",
+  "session_uuid": "db654093-...",
+  "recording": {
+    "duration_secs": 125,
+    "file_size_mb": 487.2,
+    "fps_actual": 29.8,
+    "frames_dropped": 12
+  },
+  "system": {
+    "disk_free_mb": 28450,
+    "cpu_percent": 45.2
+  },
+  "timestamp": "2026-03-23T18:30:00Z"
+}
+```
+
+## Health Values
+
+| Value | Meaning |
+|-------|---------|
+| `ok` | All systems nominal |
+| `warning` | Degraded (high CPU, frames dropping) |
+| `error` | Fatal issue, recording stopped |
+
+## Node Configuration
+
+Configuration via `.env` file:
+
+```env
+# Node Identity
+NODE_ID=cam-01
+NODE_NAME=Front Camera
+
+# MQTT
+MQTT_BROKER=melb-01-ctlr
+MQTT_PORT=1883
+MQTT_TOPIC_PREFIX=ctlr
+
+# Preflight Checks
+PREFLIGHT_DISK_MIN_MB=1024
+PREFLIGHT_CAMERA_DEVICE=/dev/video0
+PREFLIGHT_STORAGE_PATH=/mnt/recordings
+
+# Recording
+RECORDING_DISK_STOP_MB=500
+RECORDING_FPS=30
+RECORDING_RESOLUTION=1920x1080
+
+# Health Reporting
+HEALTH_INTERVAL_SECS=5
+STATUS_INTERVAL_SECS=30
+```
+
+## Preflight Checks
+
+All configurable via `.env`:
+
+| Check | Config | Default | Fail Action |
+|-------|--------|---------|-------------|
+| Disk space | `PREFLIGHT_DISK_MIN_MB` | 1024 | Reject |
+| Camera accessible | `PREFLIGHT_CAMERA_DEVICE` | /dev/video0 | Reject |
+| Storage writable | `PREFLIGHT_STORAGE_PATH` | /mnt/recordings | Reject |
+
+## Recording Safeguards
+
+| Check | Config | Default | Action |
+|-------|--------|---------|--------|
+| Disk low | `RECORDING_DISK_STOP_MB` | 500 | Stop, finalize file |
+
+## Error Handling
+
+- **Isolated failures:** Node errors do not affect other nodes
+- **On fatal error:** Stop recording → finalize file → publish error → return to `ready`
+- **Controller tracks:** Which nodes are healthy vs failed per session
+
+## File Naming
+
+```
+{session_uuid}_{node_id}.mp4
+```
+
+Example: `db654093-03fc-42cf-bcd4-f072232fac96_cam-01.mp4`
